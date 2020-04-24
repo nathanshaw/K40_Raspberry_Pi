@@ -1,25 +1,20 @@
 from time import sleep
-from oscpy.server import OSCThreadServer
-from oscpy.client import OSCClient
 import subprocess
 import Adafruit_SSD1306
 import Adafruit_GPIO.SPI as SPI
-import Adafruit_MCP3008
 from PIL import Image
 from PIL import ImageDraw
 from PIL import ImageFont
 import neopixel
 from neopixel import Color
-
-# -------------- Custom Packages ------------------------
-from encoders import encoders
-from pwr_button import pwr_button
+import RPi.GPIO as GPIO
+GPIO.setmode(GPIO.BCM)
 
 # -------------------------------------------------------
 #                      NeoPixels
 # -------------------------------------------------------
 # LED strip configuration:
-LED_COUNT      = 2       # Number of LED pixels
+LED_COUNT      = 50       # Number of LED pixels
 LED_PIN        = 18      # GPIO pin connected to the pixels (18 uses PWM!).
 #LED_PIN        = 10      # GPIO pin connected to the pixels (10 uses SPI /dev/spidev0.0).
 LED_FREQ_HZ    = 800000  # LED signal frequency in hertz (usually 800khz)
@@ -45,51 +40,18 @@ strip = neopixel.Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
 strip.begin()
 
 # -------------------------------------------------------
-# MSP3008's
+# ADS1015 - 4 channel I2C ADC
 # -------------------------------------------------------
-# MCP3008 #1:
-# encoder #1: 1,2,3
-# encoder #2: 4,5,6
-# pot #1: 7
-# pot #2: 8
-
-# MCP3008 #2:
-# encoder #3 1,2,3
-# stompbuttons 1-3: 4,5,6
-# switch : 7,8
-
-# Hardware SPI configuration:
-SPI_PORT   = 0
-SPI_DEVICE0 = 0 # 0
-SPI_DEVICE1 = 1 # 0
-
-mcp1 = Adafruit_MCP3008.MCP3008(spi=SPI.SpiDev(SPI_PORT, SPI_DEVICE0))
-mcp2 = Adafruit_MCP3008.MCP3008(spi=SPI.SpiDev(SPI_PORT, SPI_DEVICE1))
+adc = Adafruit_ASD1x15.ADS1015()
+pot_vals = [0.0, 0.0, 0.0, 0.0]
+last_pot_vals = [0.0, 0.0, 0.0, 0.0]
 
 # -------------------------------------------------------
 # Switches
 # -------------------------------------------------------
-pwr_but = pwr_button.PowerButton()
-
-last_mode_switch_val = 0
-mode_switch_val = 0 # ranges from 0-2
-mode_switch_pins = [6,7]
-
-# -------------------------------------------------------
-# Potentiometers
-# -------------------------------------------------------
-pot_vals = [0.0,0.0]
-last_pot_vals = [0,0]
-pot_pins = [6,7]
-
-# -------------------------------------------------------
-# Stompbuttons
-# -------------------------------------------------------
-# the stomp buttons use the first 3 pins of the first mcp
-st_but_vals = [0, 0, 0]
-last_st_but_vals = [0, 0, 0]
-st_but_pins = [3, 4, 5]
-
+but_pins = [25, 24, 23]
+but_vals = [0, 0, 0]
+last_but_vals = [0, 0, 0]
 
 # -------------------------------------------------------
 # for the OLED Display
@@ -135,190 +97,19 @@ lg_font = ImageFont.truetype('/home/pi/stft-pedal/prototype/hardware/font.ttf', 
 # -------------------------------------------------------
 # Functions
 # -------------------------------------------------------
-def sendOutputGain(gain):
-    client.send_message(b"/output/gain", [float(gain)])
-
-def sendWetDryGain(gain):
-    client.send_message(b"/wetdry/gain", [float(gain)])
-
-def sendSwitchEvent(value):
-    client.send_message(b"/switch", [int(value)])
-
-def sendEncVal(encNum, value):
-    client.send_message(b"/encoder", [encNum, float(value)])
-
-def recvContEncoderInfo(encNum, name, minv, maxv, step, start):
-    enc = encoders.Encoders.getInstance(mcp1, mcp2)
-    enc.setEncoderContInfo(encNum, str(name)[2:-1], minv, maxv, step, start)
-    print("received continious encoder info {} {}".format(encNum, name))
-    enc.printStats(encNum)
-
-def recvDisEncoderInfo(encNum, name, start, vals):
-    enc = encoders.Encoders.getInstance(mcp1, mcp2)
-    enc.setEncoderDisInfo(encNum, name, start, vals)
-    # print('-'*10)
-    # print('discrete encoder value{} {}'.format(type(vals), vals))
-    # print('-'*10)
-
-def sendStompEvent(stompNum):
-    client.send_message(b"/stomp", [stompNum])
-
-def recvBypassInfo(bypass_state):
-    if bypass_state == 0:
-        displayLines("BYPASS OFF")
-        strip.setBrightness(LED_BRIGHTNESS)
-        setStompLED(system.status_color)
-        system.bypass = 0
-        print("bypass turned off")
-    else:
-        displayLines("BYPASS ON")
-        system.bypass = 1
-        setStompLED(Color(0, 10, 0))
-        strip.setBrightness(10)
-        print("bypass turned on")
-
-def recvDisplayInfo(t1, t2, t3, t4):
-    print(" received display message")
-    print(t1)
-    print(t2)
-    print(t3)
-    print(t4)
-
-def recvModeInfo(modeName, bypass):
-    global mode_switch_val;
-    system.mode = str(modeName)[2:-1]
-    displayLines(system.mode)
-    setStatusColor(system.mode, bypass)
-    if system.mode == "PHYSICAL":
-        sendSwitchEvent("PM: " + mode_switch_val)
-    print("mode message received {}".format(system.mode))
-    print("-"*10)
-
-def recvSwitchInfo(value):
-    value = str(value)[2:-1]
-    print("-------------------------------")
-    print("received switch info {}".format(value))
-    print("-------------------------------")
-    displayLines(value)
-
-def recvShutdownMsg(temp):
-    print("shutting down power")
-    shut = "sudo shutdown -h now"
-    displayLines("SHUTDOWN")
-    setStatusLED(wheel(colors['RED']),0)
-    sleep(2)
-    displayLines("          ")
-    strip.setPixelColor(0, wheel(-1))
-    strip.setPixelColor(1, wheel(-1))
-    strip.show()
-    process = subprocess.Popen(shut.split(), stdout=subprocess.PIPE)
-    print(process.communicate())
-
-def recvPitchMsg(pitch):
-    pitch = str(pitch).split(".")[0] + "."  + str(pitch).split(".")[1][:2]
-    displayLines(["Onset Detected", str(pitch)])
-
-def displayLines(strings, fill=0):
-    draw.rectangle((0,0,width, height), outline=0, fill=fill)
-    lines = 0
-    if type(strings) == list:
-        for s in strings:
-            if s != '':
-                lines = lines + 1
-    elif type(strings) == str:
-        lines = 1
-
-    if lines > 2:
-        for i, string in enumerate(strings):
-            draw.text((0, top + (i*size3) + 1), " " + str(string), font=sm_font, fill=255-fill)
-    elif lines == 2:
-        for i, string in enumerate(strings):
-            draw.text((0, top + (i*size2) + 1), " " + str(string), font=m_font, fill=255-fill)
-    else:
-        draw.text((0, top), " " + str(strings), font=lg_font, fill=255-fill)
-    disp.image(image)
-    disp.display()
-
-def displayEncoderChange(n, fill=0):
-    if n >  -1 and n < 3:
-        enc = encoders.Encoders.getInstance(mcp1, mcp2)
-        if enc.type[n] == 'continious':
-            strings = [enc.name[n], str(enc.val[n])[:4]]
-            # ,"{} - {} - {}".format(enc.min[n], enc.val[n], enc.max[n])]
-            displayLines(strings, fill)
-        elif enc.type[n] == 'discrete':
-            # print("encoder{} value {}".format(n, enc.val[n]), " ", n)
-            if enc.val[n] > -1:
-                try:
-                    strings = ["{}".format(enc.name[n]),
-                            "{}".format(enc.d_val[n][enc.val[n]][-15:])]
-                except IndexError:
-                    print("index : ", n)
-                    print("enc name : ", enc.name[n])
-                    print("enc dval : ", enc.d_val[n])
-                    print("enc val  : ", enc.val[n])
-                    strings = ["{}".format(enc.name[n]),
-                            "{}".format(enc.d_val[n][enc.val[n]])]
-                displayLines(strings, fill)
-
-def storeCurrentValues():
-    """
-    Moves all of the current vals to last_vals
-    """
-    global pwr_val
-    global mode_switch_val
-    global last_mode_switch_val
-    last_mode_switch_val = mode_switch_val
-    for i, val in enumerate(pot_vals):
-        last_pot_vals[i] = val
-    for i, val in enumerate(st_but_vals):
-        last_st_but_vals[i] = val
-
-def readMCPs():
+def readPots():
     # Main program loop.
     # Read all the ADC channel values in a list.
-    # The read_adc function will get the value of the specified channel (0-7).
-    ########################################
-    # MCP3008 #1:
-    ########################################
-    # encoder #1: 1,2,3
-    # encoder #2: 4,5,6
-    # pots: 7, 8
-
-
     # get the pot values from the last two input
-    for i, pin in enumerate(pot_pins):
-        pot_vals[i] = float(mcp1.read_adc(pin))/1023
-        if pot_vals[i] < 0.025:
-            pot_vals[i] = 0.0
-        elif (pot_vals[i] > 0.975):
-            pot_vals[i] = 1.0
+    for i in range(4):
+        last_pot_vals[i] = pot_vals[i]
+        pot_vals[i] = adc.read_adc(i, gain=1) / 4096
 
-    ########################################
-    # mcp3008 #2:
-    ########################################
-    # encoder #3 1,2,3
-    # stompbuttons 1-3: 4,5,6
-    # mode switch: 7, 8
+def readButtons():
+    last_but_vals = but_vals;
+    for i in range(3):
+        but_vals[i] = gpio.input(but_pins[i]
 
-    # stompbuttons from next three pins
-    for i, pin in enumerate(st_but_pins):
-        if mcp2.read_adc(pin) < 600:
-            st_but_vals[i] = 0
-        else:
-            st_but_vals[i] = 1
-
-    # mode switch from the last two pins
-    _temp_mode = 2
-    for i, pin in enumerate(mode_switch_pins):
-        _val = mcp2.read_adc(pin)
-        # print("mode switch {} : {}".format(i, _val))
-        if _val < 700: # if the pin is low then the switch is in that position
-            _temp_mode = i
-    global mode_switch_val
-    if mode_switch_val  != _temp_mode:
-        mode_switch_val = _temp_mode
-    return mode_switch_val
 
 def printChanges():
     """
@@ -350,16 +141,6 @@ def wheel(pos):
     else:
         pos -= 170
         return Color(0, pos * 3, 255 - pos * 3)
-
-def powerButton():
-    """
-    this function checks the state of the power switch
-    it it is low (in the off position) we shutdown the raspberrpy pi
-
-    todo: needs to also indicate this with the neopixels
-    """
-    if pwr_but.readPwr():
-        client.send_message(b"/shutdown", [1])
 
 def setStatusColor(m, b, s=0):
     # print("setStatusColor : ", m)
@@ -454,78 +235,43 @@ def sendOscOnChanges(system):
             sendStompEvent(i)
             print("stompbutton {} has been stomped".format(i))
 
-def setStompLED(color):
-    strip.setPixelColor(1, color)
+def setStripColor(color):
+    for i in range(50):
+        strip.setPixelColor(i, color)
     strip.show()
 
-def setStatusLED(color, b):
-    strip.setPixelColor(0, color)
-    strip.show()
-    if b == 0:
-        print("system bypass off stomp set to green")
-        strip.setPixelColor(1, system.status_color)
-        strip.show()
-    else:
-        print("system bypass on stomp set to red")
-        strip.setPixelColor(1, Color(0,10,0))
-        strip.show()
-
-class SystemState():
-
-    mode = "AM"
-    gain = 1.0
-    wet = 1.0
-    pot_vals = [0,0,0]
-    enc_vals = [0,0,0]
-    bypass = 0
-    status_color = Color(0,0,0)
-
-    def _init__(self):
-        print("created a new system state instance")
+def updateStrips():
+    # if the button for the NeoPixels is on then set the color
+    # according to the position of a Hue, Saturation, and Brightness pot
+    if but_vals[0] == True:
+        color = strip.ColorHSV(pot_vals[0], pot_vals[1], pot_vals[2]);
+        setStripColor(color);
 
 def boot(t=0.5):
     print("booting system")
     print("||||||||||||||||||||||||||||||||||||||")
     print("3")
     displayLines("Booting")
-    setStatusLED(wheel(colors['RED']),1)
+    setStripColor(wheel(colors['RED']),1)
     strip.show()
     sleep(t)
     print("2")
-    setStatusLED(wheel(colors['ORANGE']),1)
+    setStripColor(wheel(colors['ORANGE']),1)
     strip.show()
     sleep(t)
     print("1")
-    setStatusLED(wheel(colors['YELLOW']),1)
+    setStripColor(wheel(colors['YELLOW']),1)
     strip.show()
     sleep(t)
     print("0")
-    setStatusLED(wheel(colors['GREEN']),1)
+    setStripColor(wheel(colors['GREEN']),1)
     strip.show()
 
 def mainLoop(system):
-        enc = encoders.Encoders.getInstance(mcp1, mcp2)
-        storeCurrentValues()
-        readMCPs()
-        e_change = enc.read()
-        if e_change != -1:
-            displayEncoderChange(e_change)
-        sendOscOnChanges(system)
-        powerButton()
+    readPots()
+    readButtons();
+    updateStrips();
 
 if __name__ == "__main__":
-    client = OSCClient('127.0.0.1', port=6449)
-    osc = OSCThreadServer()
-    sock = osc.listen(address='127.0.0.1', port=6450, default=True)
-    osc.bind(b'/display', recvDisplayInfo)
-    osc.bind(b'/pitch', recvPitchMsg)
-    osc.bind(b'/switchInfo', recvSwitchInfo)
-    osc.bind(b'/shutdown', recvShutdownMsg)
-    osc.bind(b'/contEncoderInfo', recvContEncoderInfo)
-    osc.bind(b'/disEncoderInfo', recvDisEncoderInfo)
-    osc.bind(b'/modeInfo', recvModeInfo)
-    osc.bind(b'/bypass', recvBypassInfo)
-    system = SystemState()
-    boot(0.1)
     while True:
         mainLoop(system)
